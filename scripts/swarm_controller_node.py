@@ -24,9 +24,9 @@ class SwarmControllerNode():
             
         rospy.set_param('/swarm_num_drones', self.num_drones)
         
-        # ===== ATO 模块开关 =====
+        # ===== ATO 模块开关 (已更新命名) =====
         print("\n--- Algorithm Module Configuration ---")
-        module_input = input(">>> Enable ATO (Adaptive Topology Optimizer)? [y/N]: ")
+        module_input = input(">>> Enable ATO (Adaptive Trajectory Optimization)? [y/N]: ")
         self.enable_ato = True if module_input.lower() == 'y' else False
         
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -62,7 +62,6 @@ class SwarmControllerNode():
         poses = np.array([[p.x, p.y, p.z] for p in msg.vector])
         
         if self.start_poses is None:
-            # 目标分配交给底层的 ATO 去做
             self.controller.distribute_goals(poses, self.goals) 
             self.start_poses = poses
 
@@ -102,14 +101,16 @@ class SwarmControllerNode():
                 break
             
             shape_name = user_input.replace(" ", "_")
-            self.controller.current_log_name = f"data_{shape_name}"
+            
+            mode_str = "ATO" if self.enable_ato else "Base"
+            self.controller.current_log_name = f"data_{shape_name}_{mode_str}"
             
             self.process_user_input(user_input)
             self.start_poses = None
             self.is_running = True 
-            print(f"[*] Command sent. Deploying '{shape_name}'...")
+            print(f"[*] Command sent. Deploying '{shape_name}' (Log: {self.controller.current_log_name}.csv)...")
 
-            input("\n>>> Press 'Enter' when formation is complete to generate plots...")
+            input("\n>>> Press 'Enter' when formation is complete to generate individual plots...")
             self.is_running = False 
             
             self.controller.generate_plots()
@@ -128,8 +129,9 @@ class SwarmControllerNode():
                 except:
                     pass
 
+            # ===== 第二轮交互的模块开关也同步更新 =====
             print("\n--- Algorithm Module Configuration (New Round) ---")
-            module_input = input(f">>> Enable ATO (Adaptive Topology Optimizer)? (Current: {self.enable_ato}) [y/N]: ")
+            module_input = input(f">>> Enable ATO (Adaptive Trajectory Optimization)? (Current: {self.enable_ato}) [y/N]: ")
             self.enable_ato = True if module_input.lower() == 'y' else False
             self.controller.enable_ato = self.enable_ato
             print(f"[*] Mode updated: ATO Enabled={self.enable_ato}")
