@@ -33,45 +33,76 @@ class APFSwarmController():
         self.start_time = 0.0        
         self.last_csv_path = ""      
 
+        # ===== 🌟 SRM (Safe Return Module) 核心参数 =====
+        self.is_returning = False
+        self.return_start_poses = None
+        self.return_home_poses = None
+        self.return_start_time = 0
+        self.return_duration = 5.0
+
+    def initiate_safe_return(self, start_poses, home_poses):
+        """
+        🌟 SRM: 绝对时间倒流 + 呼吸网格 (Breathing Grid)
+        """
+        self.is_returning = True
+        n = min(len(start_poses), len(home_poses))
+        
+        # 强制第 i 架飞回第 i 个家，保留 1:1 绝对映射，绝不重新分配
+        self.return_start_poses = start_poses[:n].copy()
+        self.return_home_poses = home_poses[:n].copy()
+            
+        max_dist = np.max(np.linalg.norm(self.return_home_poses - self.return_start_poses, axis=1))
+        # 预留充足的降落时间，让呼吸网格的展开与收缩动画极其优雅
+        self.return_duration = max(max_dist / (self.max_vel * 0.45), 7.0) 
+        
+        self.return_start_time = time.time()
+        self.goals = self.return_start_poses.copy() 
+        
+        print(f"\n[SRM] Safe Return Module Activated!")
+        print(f"[*] Executing 'Breathing Grid' trajectory to eliminate APF walls. Est. time: {self.return_duration:.1f}s")
+
     def distribute_goals(self, start, goals):
-        """
-        ======================================================================
-        🌟 ATO 终极定稿版：双模阈值判决 + 拓扑解耦
-        ======================================================================
-        """
+        """ ATO 模块：空间流形松弛 + 拓扑解耦 """
         if self.enable_ato and len(goals) > 1:
-            # 1. 计算每个点的最近邻距离，评估集群的真实空间密度
             dist_matrix_llm = cdist(goals, goals)
             np.fill_diagonal(dist_matrix_llm, np.inf) 
-            nn_dists = np.min(dist_matrix_llm, axis=1) 
+            effective_min = np.percentile(np.min(dist_matrix_llm, axis=1), 10)
+            if effective_min < 0.001: effective_min = 0.001 
             
-            # 取出最拥挤的那一对的距离，作为天然安全的判决线
-            min_dist_llm = np.min(nn_dists)
+            target_spacing = self.min_dist * 0.90 
             
-            # 【核心逻辑：双态判决】
-            if min_dist_llm >= self.min_dist:
-                # 模式 A：稀疏形态 (数量少，天然宽敞)
-                # 绝对不修改体积！保持 scale = 1.0
-                scale = 1.0
-                print(f"\n[ATO] Sparse Swarm (min={min_dist_llm:.2f}m >= {self.min_dist}m). Scale=1.0. Applying Topology Decoupling only.")
-            else:
-                # 模式 B：密集形态 (数量多，必定相撞)
-                # 取拥挤度前 10% 的间距作为参考，完美过滤掉个别极其异常的重合点
-                effective_min = np.percentile(nn_dists, 10)
-                if effective_min < 0.05: effective_min = 0.05 # 底线保护
-                
-                # 目标间距设为安全线的 0.96 倍，保留真实物理排斥的“毛刺震荡”
-                target_spacing = self.min_dist * 0.96 
-                scale = target_spacing / effective_min
-                
-                # 🌟 终极膨胀锁：最大放大倍数不得超过 2.5 倍，彻底消灭“飞出屏幕”的现象
-                scale = min(scale, 2.5) 
-                print(f"\n[ATO] Dense Swarm. Effective_min={effective_min:.3f}m. Volume safely scaled by {scale:.2f}x.")
-
+            scale = target_spacing / effective_min
+            scale = min(max(scale, 1.0), 3.0) 
+            
             centroid = np.mean(goals, axis=0)
             scaled_goals = centroid + (goals - centroid) * scale
 
-            # 2. 拓扑解耦：全局最优消除轨迹交叉
+            # 空间流形松弛 (Spatial Manifold Relaxation)
+            for _ in range(50):
+                dists = cdist(scaled_goals, scaled_goals)
+                np.fill_diagonal(dists, np.inf)
+                min_dists = np.min(dists, axis=1)
+                
+                if np.min(min_dists) >= target_spacing * 0.99:
+                    break
+                    
+                displacement = np.zeros_like(scaled_goals)
+                for i in range(len(scaled_goals)):
+                    mask = dists[i] < target_spacing
+                    if np.any(mask):
+                        vecs = scaled_goals[i] - scaled_goals[mask]
+                        ds = dists[i][mask].reshape(-1, 1)
+                        pushes = (vecs / ds) * (target_spacing - ds) * 0.5
+                        displacement[i] = np.sum(pushes, axis=0)
+                
+                scaled_goals += displacement
+            
+            final_dists = cdist(scaled_goals, scaled_goals)
+            np.fill_diagonal(final_dists, np.inf)
+            final_min = np.min(final_dists)
+            print(f"\n[ATO] Spatial Relaxation Complete. Safe min_dist: {final_min:.3f}m.")
+
+            # 拓扑解耦
             dist_matrix = cdist(start, scaled_goals)
             row_ind, col_ind = linear_sum_assignment(dist_matrix)
             
@@ -81,11 +112,10 @@ class APFSwarmController():
                 
             self.goals = out_goals
         else:
-            # Baseline 原味贪心分配
             dist_matrix = cdist(start, goals)
             out_goals = np.zeros_like(goals)
             for i in range(start.shape[0]):
-                ind = np.argmin(dist_matrix[i][dist_matrix[i]>0])
+                ind = np.argmin(dist_matrix[i])
                 if i < len(out_goals):
                     out_goals[i] = goals[ind]
                 dist_matrix[i, :] = np.inf
@@ -93,14 +123,30 @@ class APFSwarmController():
             self.goals = out_goals
 
     def get_control(self, poses) -> None:
-        """
-        🚨 底层 APF 引擎：绝对控制变量 (100% 原始代码，零修改)
-        """
+        """ 底层 APF 引擎 """
         n = min(self.goals.shape[0], poses.shape[0])
         poses = poses[:n]
         if self.velocities is None:
             self.velocities = np.zeros_like(poses)
             
+        # ======================================================================
+        # 🌟 SRM 会呼吸的网格 (The Breathing Grid Algorithm)
+        # ======================================================================
+        if self.is_returning:
+            elapsed = time.time() - self.return_start_time
+            progress = min(elapsed / self.return_duration, 1.0)
+            smooth_p = progress * progress * (3 - 2 * progress) # 0 到 1 的平滑进度
+            
+            # 核心魔法：使用正弦波让网格在飞行中途最高放大 2.2 倍，拉开巨大空隙
+            bloom_scale = 1.0 + 1.2 * np.sin(np.pi * smooth_p) 
+            
+            # 计算动态呼吸目标点
+            centroid = np.mean(self.return_home_poses, axis=0)
+            bloomed_home = centroid + (self.return_home_poses - centroid) * bloom_scale
+            
+            self.goals[:n] = self.return_start_poses + (bloomed_home - self.return_start_poses) * smooth_p
+        # ======================================================================
+
         ball_tree = BallTree(poses[:, :2], metric='euclidean')
         control_vels = np.zeros_like(poses)
 
@@ -138,8 +184,13 @@ class APFSwarmController():
                 control_vels[k] = (control_vels[k] / speed) * self.max_vel
         self.velocities[:n] = control_vels.copy()
 
+        # ======================================================================
+        # 📊 数据记录逻辑：修复了 SyntaxError 语法截断的 bug
+        # ======================================================================
         if self.log_dir and self.current_log_name:
             full_path = os.path.join(self.log_dir, f"{self.current_log_name}.csv")
+            
+            # 此处完整保留了判断条件
             if self.last_csv_path != full_path:
                 self.csv_initialized = False
                 self.last_csv_path = full_path
@@ -174,6 +225,9 @@ class APFSwarmController():
         return control_vels
 
     def generate_plots(self):
+        """
+        📈 恢复的图表生成逻辑：基于记录的阵型数据完美出图
+        """
         if not self.last_csv_path or not os.path.exists(self.last_csv_path): return
         
         mode_prefix = "ATO" if self.enable_ato else "Base"

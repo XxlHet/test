@@ -24,7 +24,6 @@ class SwarmControllerNode():
             
         rospy.set_param('/swarm_num_drones', self.num_drones)
         
-        # ===== ATO 模块开关 (已更新命名) =====
         print("\n--- Algorithm Module Configuration ---")
         module_input = input(">>> Enable ATO (Adaptive Trajectory Optimization)? [y/N]: ")
         self.enable_ato = True if module_input.lower() == 'y' else False
@@ -42,6 +41,8 @@ class SwarmControllerNode():
         self.is_running = False 
         self.goals = []
         self.start_poses = None
+        self.home_poses = None  
+        self.trigger_return = False # 🌟 SRM 触发器
         
         self.controller = APFSwarmController(max_vel=1)
         self.controller.log_dir = self.save_dir 
@@ -56,11 +57,21 @@ class SwarmControllerNode():
         threading.Thread(target=self.continuous_input_prompt, daemon=True).start()
 
     def callback_state(self, msg:Vector3StampedArray):
+        poses = np.array([[p.x, p.y, p.z] for p in msg.vector])
+        
+        if self.home_poses is None or len(self.home_poses) != self.num_drones:
+            if len(poses) == self.num_drones:
+                self.home_poses = poses.copy()
+        
+        # 🌟 监听 SRM 触发信号
+        if getattr(self, 'trigger_return', False):
+            self.controller.initiate_safe_return(poses, self.home_poses)
+            self.trigger_return = False
+            self.start_poses = poses # 阻断下方的 distribute_goals
+        
         if not self.is_running or self.goals is None or np.array(self.goals).size == 0:
             return
             
-        poses = np.array([[p.x, p.y, p.z] for p in msg.vector])
-        
         if self.start_poses is None:
             self.controller.distribute_goals(poses, self.goals) 
             self.start_poses = poses
@@ -91,13 +102,33 @@ class SwarmControllerNode():
             except Exception as e:
                 print("Error: ", e)
 
+    def execute_return_sequence(self):
+        if self.home_poses is None:
+            print("🛑 Shutting down system...")
+            rospy.signal_shutdown("User exit")
+            return
+            
+        print("\n" + "="*50)
+        print("[*] 🛬 Activating SRM (Safe Return Module)...")
+        print("[*] Bypassing parking-lot paradox via cinematic morphing.")
+        print("="*50)
+        
+        self.trigger_return = True
+        self.controller.current_log_name = "" 
+        self.is_running = True
+        
+        input("\n>>> Press 'Enter' when all drones have landed safely to power off...")
+        self.is_running = False
+        print("🛑 System powered off successfully.")
+        rospy.signal_shutdown("Experiment finished")
+
     def continuous_input_prompt(self):
         rospy.sleep(1.0)
         
         while not rospy.is_shutdown():
             user_input = input("\n>>> What to build? (e.g., sphere, box) [type 'exit' to quit]: \n")
             if user_input.lower() in ['exit', 'quit']:
-                rospy.signal_shutdown("User exit")
+                self.execute_return_sequence() 
                 break
             
             shape_name = user_input.replace(" ", "_")
@@ -105,6 +136,8 @@ class SwarmControllerNode():
             mode_str = "ATO" if self.enable_ato else "Base"
             self.controller.current_log_name = f"data_{shape_name}_{mode_str}"
             
+            # 🌟 关闭返航状态，开始新的变形
+            self.controller.is_returning = False
             self.process_user_input(user_input)
             self.start_poses = None
             self.is_running = True 
@@ -117,8 +150,7 @@ class SwarmControllerNode():
             
             cont = input("\n>>> Do you want to try another experiment? (y/n): ")
             if cont.lower() != 'y':
-                print("🛑 Shutting down system...")
-                rospy.signal_shutdown("Experiment finished")
+                self.execute_return_sequence() 
                 break
                 
             new_num = input(f">>> Current drones: {self.num_drones}. Enter NEW number (or press Enter to keep): ")
@@ -126,10 +158,10 @@ class SwarmControllerNode():
                 try:
                     self.num_drones = int(new_num)
                     rospy.set_param('/swarm_num_drones', self.num_drones)
+                    self.home_poses = None 
                 except:
                     pass
 
-            # ===== 第二轮交互的模块开关也同步更新 =====
             print("\n--- Algorithm Module Configuration (New Round) ---")
             module_input = input(f">>> Enable ATO (Adaptive Trajectory Optimization)? (Current: {self.enable_ato}) [y/N]: ")
             self.enable_ato = True if module_input.lower() == 'y' else False
