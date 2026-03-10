@@ -4,108 +4,131 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 import glob
-import datetime  # 新增：用于获取当前时间生成文件夹名
+import datetime
 
-def find_latest_file(pattern):
-    """全局搜索 result 文件夹，寻找最新生成的指定 CSV 文件"""
+def get_all_csv_files(limit=30):
+    """全局搜索 result 文件夹，按生成时间倒序列出最近的 CSV 文件"""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    search_path = os.path.join(base_dir, 'result', '*', pattern)
+    search_path = os.path.join(base_dir, 'result', '**', '*.csv')
     
-    files = glob.glob(search_path)
+    # 使用 recursive=True 查找所有子目录下的 csv
+    files = glob.glob(search_path, recursive=True)
     if not files:
-        return None
+        return []
     
-    return max(files, key=os.path.getmtime)
+    # 按修改时间倒序排列（最新的在最前）
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[:limit] # 默认只显示最近的 30 个避免刷屏
 
-def generate_comparison_plots(shape_name="sphere"):
-    print(f"[*] 正在检索 '{shape_name}' 的最新实验数据...")
-    
-    # 分别独立查找最新的 Base 和 ATO 数据
-    base_csv = find_latest_file(f"data_{shape_name}_Base.csv")
-    ato_csv = find_latest_file(f"data_{shape_name}_ATO.csv")
+def generate_multi_comparison_plots():
+    print("\n" + "="*60)
+    print("   📊 Multi-Agent Swarm Data Comparison Tool")
+    print("="*60)
 
-    if not base_csv or not ato_csv:
-        print("❌ 缺少对比文件！")
-        if not base_csv:
-            print(f"   -> 未能在任何结果目录中找到 'data_{shape_name}_Base.csv'")
-        if not ato_csv:
-            print(f"   -> 未能在任何结果目录中找到 'data_{shape_name}_ATO.csv'")
+    # 1. 检索并展示文件
+    csv_files = get_all_csv_files()
+    if not csv_files:
+        print("❌ 未在 result 目录中找到任何 CSV 数据文件！")
         return
 
-    print(f"[*] 已加载 Baseline 数据: {base_csv}")
-    print(f"[*] 已加载 ATO 数据: {ato_csv}")
-    
-    df_base = pd.read_csv(base_csv)
-    df_ato = pd.read_csv(ato_csv)
+    print("\n[*] 发现以下最近的实验数据：")
+    for i, f in enumerate(csv_files):
+        # 提取相对路径，方便查看
+        rel_path = os.path.relpath(f, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        print(f"  [{i}] {rel_path}")
 
-    # 绘制的指标配置
+    # 2. 用户交互选择
+    print("\n" + "-"*60)
+    sel_input = input(">>> 请输入要对比的文件序号 (用逗号分隔，如 '0, 1, 3'): ")
+    
+    try:
+        indices = [int(x.strip()) for x in sel_input.split(',')]
+        selected_files = [csv_files[i] for i in indices]
+    except Exception as e:
+        print("❌ 输入格式错误或序号越界，程序退出。")
+        return
+
+    # 3. 自定义图例标签
+    print("\n" + "-"*60)
+    labels = []
+    for f in selected_files:
+        default_label = os.path.basename(f).replace('.csv', '')
+        lbl = input(f">>> 为 '{default_label}' 输入图例名称 (直接回车则使用文件名): ")
+        labels.append(lbl if lbl.strip() else default_label)
+
+    print("\n[*] 正在读取数据并生成对比图表...")
+    dfs = []
+    for f in selected_files:
+        dfs.append(pd.read_csv(f))
+
+    # 4. 创建保存目录
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_target_dir = os.path.join(base_dir, 'result', f"{timestamp}_MultiComparison")
+    os.makedirs(new_target_dir, exist_ok=True)
+    print(f"[*] 📁 创建图表输出目录: {new_target_dir}")
+
+    # 5. 学术绘图配置
     metrics = {
         'Target_Error(m)': ('Convergence Error Comparison', 'Mean Error (m)'),
         'Min_Distance(m)': ('Minimum Distance Comparison', 'Min Distance (m)'),
         'Avg_Velocity(m/s)': ('Average Velocity Comparison', 'Avg Velocity (m/s)')
     }
 
-    # 学术论文配色规范
-    color_base = '#E74C3C' # 红色系 (Baseline)
-    color_ato = '#2ECC71'  # 绿色系 (ATO Ours)
-
-    # ================= 新增：创建单独的时间戳文件夹 =================
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # 获取当前时间并格式化为 YYYYMMDD_HHMMSS
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 创建类似 result/20260309_163518_comparison 的文件夹
-    new_target_dir = os.path.join(base_dir, 'result', f"{timestamp}_comparison")
-    
-    # exist_ok=True 确保即使文件夹存在也不会报错
-    os.makedirs(new_target_dir, exist_ok=True)
-    print(f"[*] 📁 创建图表输出独立目录: {new_target_dir}")
-    # ==============================================================
+    # 使用 matplotlib 内置的优质离散色板 (Tab10) 和不同的线型以区分多条线
+    colors = plt.cm.tab10.colors
+    linestyles = ['-', '--', '-.', ':']
 
     for col, (title, ylabel) in metrics.items():
-        if col in df_base.columns and col in df_ato.columns:
-            plt.figure(figsize=(9, 5.5))
+        # 检查所有被选中的 dataframe 是否都包含这个指标
+        if all(col in df.columns for df in dfs):
+            plt.figure(figsize=(10, 6))
             
-            # Baseline: 较细的虚线
-            plt.plot(df_base['Time(s)'], df_base[col], linewidth=1.5, color=color_base, linestyle='--', label='Baseline', alpha=0.8)
+            global_max = 0.0
             
-            # ATO (Ours): 较粗的实线
-            plt.plot(df_ato['Time(s)'], df_ato[col], linewidth=2.5, color=color_ato, linestyle='-', label='ATO (Ours)')
-
-            # 添加基准辅助线
+            # 绘制每条数据线
+            for idx, df in enumerate(dfs):
+                color = colors[idx % len(colors)]
+                linestyle = linestyles[idx % len(linestyles)]
+                linewidth = 2.5 if idx == 0 else 1.8 # 突出显示第一条线（通常是主推的ATO方法）
+                
+                plt.plot(df['Time(s)'], df[col], linewidth=linewidth, color=color, 
+                         linestyle=linestyle, label=labels[idx], alpha=0.9)
+                
+                # 计算全局最大值用于动态调整Y轴
+                if not df[col].empty:
+                    global_max = max(global_max, df[col].max())
+            
+            # 添加物理基准辅助线
             if col == 'Target_Error(m)':
-                plt.axhline(y=0.0, color='black', linestyle=':', label='Ideal')
+                plt.axhline(y=0.0, color='black', linestyle=':', label='Ideal (0.0m)')
             elif col == 'Min_Distance(m)':
                 plt.axhline(y=0.3, color='black', linestyle='-.', linewidth=1.5, label='Safety Limit (0.3m)')
                 plt.axhspan(0, 0.3, color='gray', alpha=0.15)
-                max_val = max(df_base[col].max() if not df_base[col].empty else 1.0, 
-                              df_ato[col].max() if not df_ato[col].empty else 1.0)
-                plt.ylim(bottom=0.25, top=max_val * 1.05)
+                plt.ylim(bottom=0.25, top=global_max * 1.05)
             elif col == 'Avg_Velocity(m/s)':
-                plt.axhline(y=1.0, color='blue', linestyle=':', alpha=0.5, label='Max Velocity')
-                plt.ylim(bottom=-0.05, top=1.1)
+                plt.axhline(y=1.0, color='blue', linestyle=':', alpha=0.5, label='Max Velocity Limit')
+                plt.ylim(bottom=-0.05, top=global_max * 1.15 if global_max > 1.0 else 1.1)
 
-            # 论文图表格式美化
-            plt.title(title, fontweight='bold', fontsize=14)
-            plt.xlabel('Time $t$ (s)', fontsize=12)
-            plt.ylabel(ylabel, fontsize=12)
-            plt.grid(True, linestyle='--', alpha=0.5)
+            # 学术级图表美化
+            plt.title(title, fontweight='bold', fontsize=15)
+            plt.xlabel('Time $t$ (s)', fontsize=13)
+            plt.ylabel(ylabel, fontsize=13)
+            plt.grid(True, linestyle='--', alpha=0.6)
             plt.legend(loc='best', fontsize=11, frameon=True, shadow=True)
             
-            # 保存高分辨率对比图到新文件夹
-            save_name = f"Comparison_{shape_name}_{col.split('(')[0]}.png"
+            save_name = f"MultiCompare_{col.split('(')[0]}.png"
             plt.tight_layout()
             
-            # 修改：将保存路径指向刚刚创建的时间戳文件夹
             save_path = os.path.join(new_target_dir, save_name)
             plt.savefig(save_path, dpi=300)
             plt.close()
-            print(f"✅ 成功生成图表: {save_path}")
+            print(f"✅ 成功生成图表: {save_name}")
         else:
-            print(f"⚠️ 警告: 数据列 '{col}' 在 CSV 中缺失，已跳过该图表绘制。")
+            print(f"⚠️ 警告: 数据列 '{col}' 在某些选定的 CSV 中缺失，已跳过。")
+
+    print("\n[*] 🎉 所有对比图表均已生成完毕！")
+    print(f"[*] 请前往 {new_target_dir} 查看。")
 
 if __name__ == "__main__":
-    import sys
-    shape = "sphere"
-    if len(sys.argv) > 1:
-        shape = sys.argv[1]
-    generate_comparison_plots(shape)
+    generate_multi_comparison_plots()

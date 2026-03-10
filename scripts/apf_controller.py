@@ -44,11 +44,21 @@ class APFSwarmController():
         self.current_active_num = 0
 
     def initiate_safe_return(self, start_poses, home_poses):
-        """ 强制全员返航降落 (用于实验彻底结束) """
+        """ 强制全员返航降落 (方案三：基于距离原点过滤) """
         self.is_returning = True
         n = min(len(start_poses), len(home_poses))
         self.return_start_poses = start_poses[:n].copy()
-        self.return_home_poses = home_poses[:n].copy()
+        
+        # [核心修复1：解决队列错乱] 重新匹配最近降落点，消除历史索引打乱导致的交叉碰撞
+        dist_matrix = cdist(self.return_start_poses, home_poses[:n])
+        row_ind, col_ind = linear_sum_assignment(dist_matrix)
+        self.return_home_poses = np.zeros_like(self.return_start_poses)
+        for r, c in zip(row_ind, col_ind):
+            self.return_home_poses[r] = home_poses[:n][c].copy()
+
+        # [方案三核心：距离判定] 判定距离当前目标降落点大于 0.15 米的才需要动
+        dists = np.linalg.norm(self.return_start_poses - self.return_home_poses, axis=1)
+        self.moving_mask = dists > 0.15
             
         max_dist = np.max(np.linalg.norm(self.return_home_poses - self.return_start_poses, axis=1))
         self.return_duration = max(max_dist / (self.max_vel * 0.45), 7.0) 
@@ -56,7 +66,7 @@ class APFSwarmController():
         self.return_start_time = time.time()
         self.goals = self.return_start_poses.copy() 
         
-        print(f"\n[SRM] Full Fleet Safe Return Activated. Est. time: {self.return_duration:.1f}s")
+        print(f"\n[SRM] Safe Return Activated (Distance Filter). Est. time: {self.return_duration:.1f}s")
 
     def distribute_goals(self, start, goals, shape_num=None, active_num=None):
         """
@@ -147,9 +157,18 @@ class APFSwarmController():
             progress = min(elapsed / self.return_duration, 1.0)
             smooth_p = progress * progress * (3 - 2 * progress) 
             bloom_scale = 1.0 + 1.2 * np.sin(np.pi * smooth_p) 
-            centroid = np.mean(self.return_home_poses, axis=0)
+            
+            mask = getattr(self, 'moving_mask', np.ones(n, dtype=bool))
+            # 仅取确实需要移动的飞机计算中心点，防止轨迹偏移
+            centroid = np.mean(self.return_home_poses[mask], axis=0) if np.any(mask) else np.mean(self.return_home_poses, axis=0)
             bloomed_home = centroid + (self.return_home_poses - centroid) * bloom_scale
-            self.goals[:n] = self.return_start_poses + (bloomed_home - self.return_start_poses) * smooth_p
+            
+            # 仅对远离原点的飞机施加花瓣轨迹，原本就在原点的目标锁死为原地
+            for i in range(n):
+                if mask[i]:
+                    self.goals[i] = self.return_start_poses[i] + (bloomed_home[i] - self.return_start_poses[i]) * smooth_p
+                else:
+                    self.goals[i] = self.return_home_poses[i]
 
         ball_tree = BallTree(poses[:, :2], metric='euclidean')
         control_vels = np.zeros_like(poses)
@@ -180,6 +199,13 @@ class APFSwarmController():
             
             v_rep[2] = 0
             control_vels[i] = v_nom + v_rep
+
+        # [核心修复2：物理锁死] 在计算完所有斥力后，强制将地面不需要动的飞机的速度归零，彻底免疫推挤
+        if self.is_returning:
+            mask = getattr(self, 'moving_mask', np.ones(n, dtype=bool))
+            for i in range(n):
+                if not mask[i]:
+                    control_vels[i] = np.zeros(3)
 
         control_vels = 0.8 * control_vels + 0.2 * self.velocities[:n]
         for k in range(len(control_vels)):
