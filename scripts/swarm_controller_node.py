@@ -15,15 +15,23 @@ from point_distributor import PointDistributer
 
 class SwarmControllerNode():
     def __init__(self, goals=[]) -> None:
-        print("\n" + "="*50)
-        val = input(">>> Please enter the initial number of drones (default 100): ")
-        try:
-            self.num_drones = int(val) if val.strip() else 100
-        except:
-            self.num_drones = 100
-            
-        rospy.set_param('/swarm_num_drones', self.num_drones)
+        print("\n" + "="*60)
+        print("   🚀 FLOCK-GPT: Fleet Management System Initializing")
+        print("="*60)
         
+        # 🌟 核心理念：设定最大机队容量（无人机池）
+        val = input(">>> Enter Maximum Fleet Capacity (e.g. 200, must be >= max shape size): ")
+        try:
+            self.fleet_capacity = int(val) if val.strip() else 200
+        except:
+            self.fleet_capacity = 200
+            
+        # 设置模拟器一次性生成，后续绝不修改此参数，彻底杜绝重启
+        rospy.set_param('/swarm_num_drones', self.fleet_capacity)
+        
+        self.shape_drones = 0       # 当前形状所需无人机数
+        self.prev_active_drones = 0 # 记录上一轮飞在空中的无人机数
+
         print("\n--- Algorithm Module Configuration ---")
         module_input = input(">>> Enable ATO (Adaptive Trajectory Optimization)? [y/N]: ")
         self.enable_ato = True if module_input.lower() == 'y' else False
@@ -33,16 +41,16 @@ class SwarmControllerNode():
         self.save_dir = os.path.join(base_dir, 'result', timestamp)
         os.makedirs(self.save_dir, exist_ok=True)
         
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print(f"[*] Mode: ATO Enabled={self.enable_ato}")
-        print(f"[*] Drones: {self.num_drones} | Data Dir: {os.path.basename(self.save_dir)}")
-        print("="*50 + "\n")
+        print(f"[*] Fleet Capacity: {self.fleet_capacity} drones (Simulating...)")
+        print("="*60 + "\n")
 
         self.is_running = False 
         self.goals = []
         self.start_poses = None
         self.home_poses = None  
-        self.trigger_return = False # 🌟 SRM 触发器
+        self.trigger_return = False 
         
         self.controller = APFSwarmController(max_vel=1)
         self.controller.log_dir = self.save_dir 
@@ -59,22 +67,34 @@ class SwarmControllerNode():
     def callback_state(self, msg:Vector3StampedArray):
         poses = np.array([[p.x, p.y, p.z] for p in msg.vector])
         
-        if self.home_poses is None or len(self.home_poses) != self.num_drones:
-            if len(poses) == self.num_drones:
-                self.home_poses = poses.copy()
-        
-        # 🌟 监听 SRM 触发信号
+        # 🌟 获取模拟器中全部的机队网格坐标，作为永久的大本营
+        if self.home_poses is None and len(poses) >= self.fleet_capacity:
+            self.home_poses = poses[:self.fleet_capacity].copy()
+            print(f"[*] Captured home grid for {self.fleet_capacity} drones. Fleet ready for dispatch.")
+            
         if getattr(self, 'trigger_return', False):
             self.controller.initiate_safe_return(poses, self.home_poses)
             self.trigger_return = False
-            self.start_poses = poses # 阻断下方的 distribute_goals
+            self.start_poses = poses 
         
         if not self.is_running or self.goals is None or np.array(self.goals).size == 0:
             return
             
         if self.start_poses is None:
-            self.controller.distribute_goals(poses, self.goals) 
+            if self.home_poses is None: return # 等待环境加载
+            
+            # 计算本次调度牵涉到的无人机总数 (当前需要的 vs 原本在天上需要返航的)
+            active_drones = max(self.prev_active_drones, self.shape_drones)
+            
+            self.controller.distribute_goals(
+                poses, 
+                self.goals, 
+                shape_num=self.shape_drones, 
+                active_num=active_drones
+            ) 
             self.start_poses = poses
+            # 记录本次飞行的活跃状态，用于下一轮判断
+            self.prev_active_drones = self.shape_drones
 
         vels = self.controller.get_control(poses)
         cmd_vel = Vector3StampedArray()
@@ -97,8 +117,20 @@ class SwarmControllerNode():
                 f = local_vars.get("f")
                 if f is not None:
                     pd_dist = PointDistributer(f)
-                    points = pd_dist.generate_points(self.num_drones)
-                    self.goals = points
+                    points = pd_dist.generate_points(self.shape_drones)
+                    
+                    # 🌟 池化路由分配：构造全局目标阵列
+                    full_goals = np.zeros((self.fleet_capacity, 3))
+                    
+                    # 1. 构图部队
+                    if self.shape_drones > 0:
+                        full_goals[:self.shape_drones] = points[:self.shape_drones]
+                        
+                    # 2. 待命/返航部队
+                    if self.fleet_capacity > self.shape_drones:
+                        full_goals[self.shape_drones:] = self.home_poses[self.shape_drones:]
+                        
+                    self.goals = full_goals
             except Exception as e:
                 print("Error: ", e)
 
@@ -108,10 +140,10 @@ class SwarmControllerNode():
             rospy.signal_shutdown("User exit")
             return
             
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print("[*] 🛬 Activating SRM (Safe Return Module)...")
-        print("[*] Bypassing parking-lot paradox via cinematic morphing.")
-        print("="*50)
+        print("[*] Executing global return for all airborne drones.")
+        print("="*60)
         
         self.trigger_return = True
         self.controller.current_log_name = "" 
@@ -126,41 +158,47 @@ class SwarmControllerNode():
         rospy.sleep(1.0)
         
         while not rospy.is_shutdown():
-            user_input = input("\n>>> What to build? (e.g., sphere, box) [type 'exit' to quit]: \n")
+            # 动态请求无人机数量
+            num_input = input(f"\n>>> Enter target shape size (Max {self.fleet_capacity}): ")
+            try:
+                self.shape_drones = min(int(num_input), self.fleet_capacity)
+            except:
+                print("[!] Invalid number. Setting to 10.")
+                self.shape_drones = 10
+                
+            user_input = input(f">>> What to build with {self.shape_drones} drones? (e.g., sphere) [type 'exit' to quit]: \n")
             if user_input.lower() in ['exit', 'quit']:
                 self.execute_return_sequence() 
                 break
             
             shape_name = user_input.replace(" ", "_")
-            
             mode_str = "ATO" if self.enable_ato else "Base"
-            self.controller.current_log_name = f"data_{shape_name}_{mode_str}"
+            self.controller.current_log_name = f"data_{shape_name}_{self.shape_drones}drones_{mode_str}"
             
-            # 🌟 关闭返航状态，开始新的变形
             self.controller.is_returning = False
             self.process_user_input(user_input)
             self.start_poses = None
             self.is_running = True 
-            print(f"[*] Command sent. Deploying '{shape_name}' (Log: {self.controller.current_log_name}.csv)...")
+            
+            # 极其优雅的调度提示
+            if self.shape_drones > self.prev_active_drones:
+                print(f"[*] Scaling UP: {self.prev_active_drones} airborne + {self.shape_drones - self.prev_active_drones} launching from ground.")
+            elif self.shape_drones < self.prev_active_drones:
+                print(f"[*] Scaling DOWN: {self.shape_drones} morphing shape, {self.prev_active_drones - self.shape_drones} automatically returning to base.")
+            else:
+                print(f"[*] Seamless Morphing: All {self.shape_drones} airborne drones transitioning to new shape.")
+                
+            print(f"[*] Deploying '{shape_name}' (Log: {self.controller.current_log_name}.csv)...")
 
             input("\n>>> Press 'Enter' when formation is complete to generate individual plots...")
             self.is_running = False 
             
             self.controller.generate_plots()
             
-            cont = input("\n>>> Do you want to try another experiment? (y/n): ")
+            cont = input("\n>>> Do you want to try another shape? (y/n): ")
             if cont.lower() != 'y':
                 self.execute_return_sequence() 
                 break
-                
-            new_num = input(f">>> Current drones: {self.num_drones}. Enter NEW number (or press Enter to keep): ")
-            if new_num.strip():
-                try:
-                    self.num_drones = int(new_num)
-                    rospy.set_param('/swarm_num_drones', self.num_drones)
-                    self.home_poses = None 
-                except:
-                    pass
 
             print("\n--- Algorithm Module Configuration (New Round) ---")
             module_input = input(f">>> Enable ATO (Adaptive Trajectory Optimization)? (Current: {self.enable_ato}) [y/N]: ")
@@ -168,11 +206,9 @@ class SwarmControllerNode():
             self.controller.enable_ato = self.enable_ato
             print(f"[*] Mode updated: ATO Enabled={self.enable_ato}")
 
-            rospy.set_param('/swarm_reset', True)
             self.goals = []          
             self.start_poses = None  
-            print(f"[*] Resetting {self.num_drones} drones to initial ground positions...")
-            rospy.sleep(1.0) 
+            rospy.sleep(0.5) 
 
 if __name__ == "__main__": 
     try:

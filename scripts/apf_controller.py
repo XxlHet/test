@@ -33,84 +33,98 @@ class APFSwarmController():
         self.start_time = 0.0        
         self.last_csv_path = ""      
 
-        # ===== 🌟 SRM (Safe Return Module) 核心参数 =====
         self.is_returning = False
         self.return_start_poses = None
         self.return_home_poses = None
         self.return_start_time = 0
         self.return_duration = 5.0
+        
+        # 🌟 动态记录当前活跃和构图的无人机数量，避免待命机群污染数据
+        self.current_shape_num = 0
+        self.current_active_num = 0
 
     def initiate_safe_return(self, start_poses, home_poses):
-        """
-        🌟 SRM: 绝对时间倒流 + 呼吸网格 (Breathing Grid)
-        """
+        """ 强制全员返航降落 (用于实验彻底结束) """
         self.is_returning = True
         n = min(len(start_poses), len(home_poses))
-        
-        # 强制第 i 架飞回第 i 个家，保留 1:1 绝对映射，绝不重新分配
         self.return_start_poses = start_poses[:n].copy()
         self.return_home_poses = home_poses[:n].copy()
             
         max_dist = np.max(np.linalg.norm(self.return_home_poses - self.return_start_poses, axis=1))
-        # 预留充足的降落时间，让呼吸网格的展开与收缩动画极其优雅
         self.return_duration = max(max_dist / (self.max_vel * 0.45), 7.0) 
         
         self.return_start_time = time.time()
         self.goals = self.return_start_poses.copy() 
         
-        print(f"\n[SRM] Safe Return Module Activated!")
-        print(f"[*] Executing 'Breathing Grid' trajectory to eliminate APF walls. Est. time: {self.return_duration:.1f}s")
+        print(f"\n[SRM] Full Fleet Safe Return Activated. Est. time: {self.return_duration:.1f}s")
 
-    def distribute_goals(self, start, goals):
-        """ ATO 模块：空间流形松弛 + 拓扑解耦 """
-        if self.enable_ato and len(goals) > 1:
-            dist_matrix_llm = cdist(goals, goals)
-            np.fill_diagonal(dist_matrix_llm, np.inf) 
-            effective_min = np.percentile(np.min(dist_matrix_llm, axis=1), 10)
-            if effective_min < 0.001: effective_min = 0.001 
-            
-            target_spacing = self.min_dist * 0.90 
-            
-            scale = target_spacing / effective_min
-            scale = min(max(scale, 1.0), 3.0) 
-            
-            centroid = np.mean(goals, axis=0)
-            scaled_goals = centroid + (goals - centroid) * scale
+    def distribute_goals(self, start, goals, shape_num=None, active_num=None):
+        """
+        🌟 终极 ATO 混合调度：支持半空中分离、补充与变阵
+        """
+        if shape_num is None: shape_num = len(goals)
+        if active_num is None: active_num = len(goals)
+        
+        self.current_shape_num = shape_num
+        self.current_active_num = active_num
 
-            # 空间流形松弛 (Spatial Manifold Relaxation)
-            for _ in range(50):
-                dists = cdist(scaled_goals, scaled_goals)
-                np.fill_diagonal(dists, np.inf)
-                min_dists = np.min(dists, axis=1)
+        if self.enable_ato and active_num > 1:
+            # 仅截取参与本次动态变化的无人机（包括待飞的、空中的、和要降落的）
+            active_start = start[:active_num]
+            active_goals = goals[:active_num]
+            
+            # 分离出构图目标与返航目标
+            shape_goals = active_goals[:shape_num]
+            rtb_goals = active_goals[shape_num:]
+
+            # 仅对构图目标执行空间流形松弛，保护待命网格不被破坏
+            if len(shape_goals) > 1:
+                dist_matrix_llm = cdist(shape_goals, shape_goals)
+                np.fill_diagonal(dist_matrix_llm, np.inf) 
+                effective_min = np.percentile(np.min(dist_matrix_llm, axis=1), 10)
+                if effective_min < 0.001: effective_min = 0.001 
                 
-                if np.min(min_dists) >= target_spacing * 0.99:
-                    break
-                    
-                displacement = np.zeros_like(scaled_goals)
-                for i in range(len(scaled_goals)):
-                    mask = dists[i] < target_spacing
-                    if np.any(mask):
-                        vecs = scaled_goals[i] - scaled_goals[mask]
-                        ds = dists[i][mask].reshape(-1, 1)
-                        pushes = (vecs / ds) * (target_spacing - ds) * 0.5
-                        displacement[i] = np.sum(pushes, axis=0)
+                target_spacing = self.min_dist * 0.90 
+                scale = min(max(target_spacing / effective_min, 1.0), 3.0) 
                 
-                scaled_goals += displacement
-            
-            final_dists = cdist(scaled_goals, scaled_goals)
-            np.fill_diagonal(final_dists, np.inf)
-            final_min = np.min(final_dists)
-            print(f"\n[ATO] Spatial Relaxation Complete. Safe min_dist: {final_min:.3f}m.")
+                centroid = np.mean(shape_goals, axis=0)
+                scaled_shape_goals = centroid + (shape_goals - centroid) * scale
 
-            # 拓扑解耦
-            dist_matrix = cdist(start, scaled_goals)
+                for _ in range(50):
+                    dists = cdist(scaled_shape_goals, scaled_shape_goals)
+                    np.fill_diagonal(dists, np.inf)
+                    min_dists = np.min(dists, axis=1)
+                    if np.min(min_dists) >= target_spacing * 0.99: break
+                        
+                    displacement = np.zeros_like(scaled_shape_goals)
+                    for i in range(len(scaled_shape_goals)):
+                        mask = dists[i] < target_spacing
+                        if np.any(mask):
+                            vecs = scaled_shape_goals[i] - scaled_shape_goals[mask]
+                            ds = dists[i][mask].reshape(-1, 1)
+                            pushes = (vecs / ds) * (target_spacing - ds) * 0.5
+                            displacement[i] = np.sum(pushes, axis=0)
+                    scaled_shape_goals += displacement
+            else:
+                scaled_shape_goals = shape_goals
+
+            # 将松弛后的构图目标与原地待命目标重新拼接
+            if len(rtb_goals) > 0:
+                scaled_active_goals = np.vstack((scaled_shape_goals, rtb_goals))
+            else:
+                scaled_active_goals = scaled_shape_goals
+
+            # 全局拓扑解耦：匈牙利算法会自动判断谁飞往新图形最近，谁直接回家降落最近！
+            dist_matrix = cdist(active_start, scaled_active_goals)
             row_ind, col_ind = linear_sum_assignment(dist_matrix)
             
-            out_goals = np.zeros_like(scaled_goals)
+            out_active_goals = np.zeros_like(scaled_active_goals)
             for r, c in zip(row_ind, col_ind):
-                out_goals[r] = scaled_goals[c]
+                out_active_goals[r] = scaled_active_goals[c]
                 
-            self.goals = out_goals
+            self.goals = np.copy(goals)
+            self.goals[:active_num] = out_active_goals
+            print(f"\n[ATO] Optimal topology computed. Shape drones: {shape_num} | RTB/Standby: {active_num - shape_num}")
         else:
             dist_matrix = cdist(start, goals)
             out_goals = np.zeros_like(goals)
@@ -123,29 +137,19 @@ class APFSwarmController():
             self.goals = out_goals
 
     def get_control(self, poses) -> None:
-        """ 底层 APF 引擎 """
         n = min(self.goals.shape[0], poses.shape[0])
         poses = poses[:n]
         if self.velocities is None:
             self.velocities = np.zeros_like(poses)
             
-        # ======================================================================
-        # 🌟 SRM 会呼吸的网格 (The Breathing Grid Algorithm)
-        # ======================================================================
         if self.is_returning:
             elapsed = time.time() - self.return_start_time
             progress = min(elapsed / self.return_duration, 1.0)
-            smooth_p = progress * progress * (3 - 2 * progress) # 0 到 1 的平滑进度
-            
-            # 核心魔法：使用正弦波让网格在飞行中途最高放大 2.2 倍，拉开巨大空隙
+            smooth_p = progress * progress * (3 - 2 * progress) 
             bloom_scale = 1.0 + 1.2 * np.sin(np.pi * smooth_p) 
-            
-            # 计算动态呼吸目标点
             centroid = np.mean(self.return_home_poses, axis=0)
             bloomed_home = centroid + (self.return_home_poses - centroid) * bloom_scale
-            
             self.goals[:n] = self.return_start_poses + (bloomed_home - self.return_start_poses) * smooth_p
-        # ======================================================================
 
         ball_tree = BallTree(poses[:, :2], metric='euclidean')
         control_vels = np.zeros_like(poses)
@@ -184,13 +188,10 @@ class APFSwarmController():
                 control_vels[k] = (control_vels[k] / speed) * self.max_vel
         self.velocities[:n] = control_vels.copy()
 
-        # ======================================================================
-        # 📊 数据记录逻辑：修复了 SyntaxError 语法截断的 bug
-        # ======================================================================
-        if self.log_dir and self.current_log_name:
+        # 🌟 仅对当前处于构图状态的无人机进行数据记录，屏蔽地面待机飞机的噪音
+        if self.log_dir and self.current_log_name and self.current_shape_num > 0:
             full_path = os.path.join(self.log_dir, f"{self.current_log_name}.csv")
             
-            # 此处完整保留了判断条件
             if self.last_csv_path != full_path:
                 self.csv_initialized = False
                 self.last_csv_path = full_path
@@ -206,15 +207,21 @@ class APFSwarmController():
                     return control_vels
 
             curr_t = round(time.time() - self.start_time, 2)
-            if n > 1:
-                diffs = poses[:, np.newaxis, :] - poses[np.newaxis, :, :]
+            
+            eval_poses = poses[:self.current_shape_num]
+            eval_goals = self.goals[:self.current_shape_num]
+            eval_vels = control_vels[:self.current_shape_num]
+            
+            if self.current_shape_num > 1:
+                diffs = eval_poses[:, np.newaxis, :] - eval_poses[np.newaxis, :, :]
                 dists = np.linalg.norm(diffs, axis=-1)
                 np.fill_diagonal(dists, np.inf)
                 min_d = round(np.min(dists), 4)
             else:
                 min_d = 0.0
-            avg_v = round(np.mean(np.linalg.norm(control_vels, axis=1)), 4)
-            err = round(np.mean(np.linalg.norm(self.goals[:n] - poses, axis=1)), 4)
+                
+            avg_v = round(np.mean(np.linalg.norm(eval_vels, axis=1)), 4)
+            err = round(np.mean(np.linalg.norm(eval_goals - eval_poses, axis=1)), 4)
 
             try:
                 with open(full_path, mode='a', newline='') as file:
@@ -225,9 +232,6 @@ class APFSwarmController():
         return control_vels
 
     def generate_plots(self):
-        """
-        📈 恢复的图表生成逻辑：基于记录的阵型数据完美出图
-        """
         if not self.last_csv_path or not os.path.exists(self.last_csv_path): return
         
         mode_prefix = "ATO" if self.enable_ato else "Base"
@@ -245,7 +249,6 @@ class APFSwarmController():
             for col, (title, ylabel, color) in metrics.items():
                 if col in df.columns:
                     plt.figure(figsize=(9, 5.5))
-                    
                     plt.plot(df['Time(s)'], df[col], linewidth=2.5 if self.enable_ato else 1.5, 
                              color=color, linestyle='-' if self.enable_ato else '--', 
                              label=algo_label, alpha=0.9)
